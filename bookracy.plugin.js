@@ -14,6 +14,7 @@ async function fetchJson(url) {
   const res = await harbor.http(url, {
     headers: HEADERS,
     responseType: "text",
+    timeoutMs: 15000,
   });
   if (!res.ok) {
     throw new Error(`HTTP ${res.status} fetching ${url}`);
@@ -25,18 +26,21 @@ async function fetchJson(url) {
   }
 }
 
-function cleanText(val) {
-  return (val || "")
-    .replace(/[^\p{L}\p{N}'’\-: ]+/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function normalizeCover(url) {
+// Covers must be absolute HTTP(S) or Harbor drops them
+function abs(url) {
   if (!url) return undefined;
   if (/^https?:\/\//i.test(url)) return url;
   if (url.startsWith("//")) return "https:" + url;
-  return BASE + (url.startsWith("/") ? url : "/" + url);
+  if (url.startsWith("/")) return BASE + url;
+  return BASE + "/" + url;
+}
+
+function cleanTitle(value) {
+  return (value || "")
+    .replace(/[^\p{L}\p{N}'’]+/gu, " ")
+    .replace(/\s+(?:kol|كول)$/iu, "")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function parseCompositeId(compositeId) {
@@ -51,18 +55,18 @@ function parseCompositeId(compositeId) {
 function itemToSummary(item) {
   if (!item || !item.md5) return null;
 
-  const rawTitle = cleanText(item.title || "Untitled");
-  const author = cleanText(item.author || "");
-  
-  // Pack metadata into ID so detail() can query the Apple Books enrichment endpoint
+  const rawTitle = cleanTitle(item.title || item.name || "Untitled");
+  const author = (item.author || item.creator || "").trim();
+
+  // Encodes metadata into ID so detail() can query the resolver
   const compositeId = `${item.md5}|${encodeURIComponent(rawTitle)}|${encodeURIComponent(author)}`;
 
   return {
     id: compositeId,
     title: rawTitle,
     author: author || undefined,
-    cover: normalizeCover(item.cover || item.image),
-    originalLanguage: item.book_lang || "en",
+    cover: abs(item.cover || item.image || item.thumbnail),
+    originalLanguage: item.book_lang || item.language || "en",
     score: item.score ? Number(item.score) : undefined,
     genres: item.book_filetype ? [item.book_filetype.toUpperCase()] : [],
     isFanMade: false,
@@ -77,9 +81,9 @@ const plugin = {
     const page = Math.floor(offset / 30) + 1;
     let query = "bestseller";
 
-    if (tagId && tagId.startsWith("genre:")) {
+    if (tagId?.startsWith("genre:")) {
       query = tagId.slice(6);
-    } else if (tagId && tagId.startsWith("sort:")) {
+    } else if (tagId?.startsWith("sort:")) {
       query = tagId.slice(5);
     }
 
@@ -92,7 +96,7 @@ const plugin = {
   async search(query, offset, tagId) {
     const page = Math.floor(offset / 30) + 1;
     let target = query;
-    if (tagId && tagId.startsWith("genre:")) {
+    if (tagId?.startsWith("genre:")) {
       target += " " + tagId.slice(6);
     }
 
@@ -104,8 +108,7 @@ const plugin = {
 
   async detail(compositeId) {
     const { md5, title, author } = parseCompositeId(compositeId);
-    
-    // Query Bookracy Apple Books metadata resolver
+
     const queryParams = new URLSearchParams();
     if (title) queryParams.set("title", author ? `${title} - ${author}` : title);
     if (author) queryParams.set("author", author);
@@ -119,22 +122,21 @@ const plugin = {
     }
 
     const meta = data?.metadata || data || {};
-    const finalTitle = cleanText(meta.title || title || md5);
-    const finalAuthor = cleanText(meta.author || author);
-    const cover = normalizeCover(meta.cover);
+    const finalTitle = cleanTitle(meta.title || title || md5);
+    const finalAuthor = (meta.author || author || "").trim();
 
     return {
       id: compositeId,
       title: finalTitle,
       author: finalAuthor || undefined,
-      cover,
-      description: meta.description || "No synopsis available.",
+      cover: abs(meta.cover),
+      description: meta.description || meta.synopsis || undefined,
       genres: Array.isArray(meta.genres) ? meta.genres : [],
       isbn: meta.isbn || undefined,
       score: meta.rating ? Number(meta.rating) : undefined,
       chapters: 1,
-      volumes: 1,
       originalLanguage: meta.locale ? meta.locale.split("-")[0] : "en",
+      isFanMade: false,
     };
   },
 
@@ -145,8 +147,7 @@ const plugin = {
         chapter: "1",
         position: 0,
         title: "Complete Edition",
-        pages: 0,
-        language: "en",
+        publishAt: undefined,
       },
     ];
   },
@@ -168,9 +169,9 @@ const plugin = {
     }
 
     const meta = data?.metadata || data || {};
-    const bookTitle = meta.title || title || "Book Overview";
-    const bookAuthor = meta.author || author ? `by ${meta.author || author}` : "";
-    const description = meta.description || "No description preview available.";
+    const bookTitle = cleanTitle(meta.title || title || "Book Overview");
+    const bookAuthor = (meta.author || author) ? `by ${meta.author || author}` : "";
+    const description = meta.description || meta.synopsis || "No description preview available.";
 
     return [
       `# ${bookTitle}`,
@@ -181,20 +182,26 @@ const plugin = {
       "---",
       `Direct MD5: ${md5}`,
       "This title is distributed as a full eBook archive.",
-    ].join("\n\n");
+    ]
+      .filter(Boolean)
+      .join("\n\n");
   },
 
   async tags() {
     return [
-      { id: "genre:science fiction", name: "Sci-Fi", group: "Genre" },
+      { id: "sort:popular", name: "Popular", group: "Sort" },
+      { id: "sort:rating", name: "Rating", group: "Sort" },
+      { id: "genre:science-fiction", name: "Sci-Fi", group: "Genre" },
       { id: "genre:fantasy", name: "Fantasy", group: "Genre" },
       { id: "genre:cyberpunk", name: "Cyberpunk", group: "Genre" },
       { id: "genre:psychology", name: "Psychology", group: "Genre" },
       { id: "genre:philosophy", name: "Philosophy", group: "Genre" },
-      { id: "sort:bestseller", name: "Bestsellers", group: "Sort" },
-      { id: "sort:trending", name: "Trending", group: "Sort" },
     ];
   },
 };
+
+if (typeof harbor !== "undefined" && typeof harbor.register === "function") {
+  harbor.register(plugin);
+}
 
 return plugin;
