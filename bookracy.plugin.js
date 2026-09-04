@@ -10,7 +10,6 @@ const HEADERS = {
   Origin: "https://bookracy.com",
 };
 
-// In-memory cache for fast lookups across views
 const cache = new Map();
 
 async function fetchJson(url) {
@@ -29,7 +28,6 @@ async function fetchJson(url) {
   }
 }
 
-// Covers MUST be absolute http(s) or Harbor drops them
 function abs(url) {
   if (!url) return undefined;
   if (/^https?:\/\//i.test(url)) return url;
@@ -48,7 +46,6 @@ function cleanTitle(val) {
 
 function isEnglishBook(item) {
   if (!item || !item.title) return false;
-  // Exclude non-Latin scripts (Cyrillic, CJK, Arabic)
   if (/[\u0400-\u04FF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF\u0600-\u06FF]/.test(item.title)) {
     return false;
   }
@@ -89,45 +86,36 @@ const plugin = {
   id: "bookracy-source",
   name: "Bookracy",
 
-  // Instant catalog discovery: single network roundtrip
   async popular(offset, tagId) {
     const safeOffset = Number(offset) || 0;
     const page = Math.floor(safeOffset / 30) + 1;
-    let query = "bestseller";
+    let query = "novel";
 
     if (tagId === "sort:rating") {
       query = "award winner";
     } else if (tagId === "sort:popular") {
-      query = "bestseller";
-    } else if (tagId?.startsWith("genre:")) {
-      query = tagId.slice(6).replace("-", " ");
+      query = "novel";
     }
 
-    const url = `${BASE}/api/books?query=${encodeURIComponent(query)}&lang=all&page=${page}&limit=50`;
+    const url = `${BASE}/api/books?query=${encodeURIComponent(query)}&lang=all&page=${page}&limit=30`;
     const data = await fetchJson(url);
     const list = Array.isArray(data) ? data : data.results || [];
 
     return list.filter(isEnglishBook).map(itemToSummary).filter(Boolean);
   },
 
-  // Instant search: single network roundtrip
   async search(query, offset, tagId) {
     const safeOffset = Number(offset) || 0;
     const page = Math.floor(safeOffset / 30) + 1;
     let target = (query || "").trim() || "fiction";
 
-    if (tagId?.startsWith("genre:")) {
-      target += " " + tagId.slice(6).replace("-", " ");
-    }
-
-    const url = `${BASE}/api/books?query=${encodeURIComponent(target)}&lang=all&page=${page}&limit=50`;
+    const url = `${BASE}/api/books?query=${encodeURIComponent(target)}&lang=all&page=${page}&limit=30`;
     const data = await fetchJson(url);
     const list = Array.isArray(data) ? data : data.results || [];
 
     return list.filter(isEnglishBook).map(itemToSummary).filter(Boolean);
   },
 
-  // Single-target deep metadata enrichment
   async detail(id) {
     let cached = cache.get(id);
 
@@ -155,7 +143,6 @@ const plugin = {
     let isbn = undefined;
     let score = undefined;
 
-    // Fetch Apple Books metadata from Bookracy resolver
     try {
       const qParams = new URLSearchParams();
       if (title && title !== id) {
@@ -199,6 +186,7 @@ const plugin = {
         chapter: "1",
         position: 0,
         title: "Complete Edition",
+        pages: 0,
         language: "en",
       },
     ];
@@ -214,7 +202,7 @@ const plugin = {
       `# ${title}`,
       author,
       "",
-      cached?.description || "This title is available as an eBook on the Bookracy network.",
+      cached?.description || "This title is available on the Bookracy network.",
       "",
       "---",
       `Source ID: ${id}`,
@@ -226,12 +214,7 @@ const plugin = {
   async tags() {
     return [
       { id: "sort:popular", name: "Popular", group: "Sort" },
-      { id: "sort:rating", name: "Award Winners", group: "Sort" },
-      { id: "genre:fiction", name: "Fiction", group: "Genre" },
-      { id: "genre:science-fiction", name: "Sci-Fi", group: "Genre" },
-      { id: "genre:fantasy", name: "Fantasy", group: "Genre" },
-      { id: "genre:thriller", name: "Thriller", group: "Genre" },
-      { id: "genre:mystery", name: "Mystery", group: "Genre" },
+      { id: "sort:rating", name: "Top Rated", group: "Sort" },
     ];
   },
 };
