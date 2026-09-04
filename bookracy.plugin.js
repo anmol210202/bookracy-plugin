@@ -1,14 +1,16 @@
 // Harbor eBook source plugin for Bookracy
 //
 // This plugin runs in Harbor's isolated JavaScript worker.
-// It interfaces with the Bookracy open-library API (https://api.bookracy.com)
-// to provide live search, trending discovery charts, canonical metadata hints,
-// and in-terminal/in-app eBook reading via pure JavaScript EPUB extraction.
+// It interfaces with the Bookracy API (https://api.bookracy.com)
+// with resilient Open Library fallbacks to bypass Cloudflare bot challenges,
+// providing live search, trending discovery charts, canonical metadata hints,
+// and in-engine EPUB reading.
 
 const BASE_URL = "https://api.bookracy.com";
+const OPEN_LIBRARY_URL = "https://openlibrary.org";
 
 const REQ_HEADERS = {
-  "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
   "Accept": "application/json",
   "Referer": "https://bookracy.com/",
   "Origin": "https://bookracy.com",
@@ -25,8 +27,20 @@ function cleanTitle(value) {
     .trim();
 }
 
-function escapeRegex(str) {
-  return (str || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function cleanBookTitle(rawTitle, author) {
+  let t = (rawTitle || "").trim();
+  t = t.replace(/_/g, " ");
+  // Remove leading release codes, volume tokens or ISBNs (e.g. "fn 155 9780593804223 ")
+  t = t.replace(/^(?:fn\s*\d+\s*)?(?:97[89]\d{10}[,\s]*)+/i, "");
+  // Remove duplicate author prefixes or suffixes
+  if (author && author !== "Unknown Author") {
+    const safeAuthor = author.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    t = t.replace(new RegExp("\\s*-\\s*" + safeAuthor + "\\s*$", "i"), "");
+    t = t.replace(new RegExp("^" + safeAuthor + "\\s*-\\s*", "i"), "");
+  }
+  t = t.replace(/\s*-\s*[A-Za-z\s,]+$/i, "");
+  const cleaned = cleanTitle(t);
+  return cleaned || cleanTitle(rawTitle);
 }
 
 function abs(url) {
@@ -37,28 +51,47 @@ function abs(url) {
   return "https://bookracy.com/" + url;
 }
 
-function toSummary(item) {
+function safeParseJson(text) {
+  if (typeof text === "object" && text !== null) return text;
+  if (typeof text !== "string" || !text.trim()) return null;
+  const trimmed = text.trim();
+  if (trimmed.startsWith("<")) return null; // Cloudflare HTML response
+  try {
+    return JSON.parse(trimmed);
+  } catch (_) {
+    return null;
+  }
+}
+
+function normalizeLanguage(langStr) {
+  if (!langStr) return "en";
+  const lower = langStr.toLowerCase();
+  if (lower.includes("eng") || lower === "en") return "en";
+  if (lower.includes("spa") || lower === "es") return "es";
+  if (lower.includes("fre") || lower === "fr") return "fr";
+  if (lower.includes("ger") || lower === "de") return "de";
+  if (lower.includes("ita") || lower === "it") return "it";
+  if (lower.includes("por") || lower === "pt") return "pt";
+  if (lower.includes("rus") || lower === "ru") return "ru";
+  if (lower.includes("chi") || lower.includes("zho") || lower === "zh") return "zh";
+  if (lower.includes("jpn") || lower === "ja") return "ja";
+  return "en";
+}
+
+function bookracyItemToSummary(item) {
   if (!item || !item.title) return null;
 
   const rawTitle = (item.title || "").trim();
   const author = (item.author || "").trim();
-
-  // Strip trailing " - Author Name" from title if present
-  let displayTitle = rawTitle;
-  if (author && author !== "Unknown Author") {
-    const authorRegex = new RegExp("\\s*-\\s*" + escapeRegex(author) + "\\s*$", "i");
-    displayTitle = displayTitle.replace(authorRegex, "");
-  }
-
-  const title = cleanTitle(displayTitle) || cleanTitle(rawTitle);
-  const id = item.md5 || title;
+  const title = cleanBookTitle(rawTitle, author);
+  const id = item.md5 ? `br:${item.md5}` : `br:${encodeURIComponent(title)}`;
 
   if (item.md5) {
     itemCache.set(item.md5, item);
     itemCache.set(id, item);
   }
 
-  // Cover resolution
+  // Cover image resolution
   let cover = item.book_image || item.cover || item.external_cover_url;
   if (!cover && item.md5) {
     cover = `${BASE_URL}/cover/${item.md5}/thumbnail.jpg`;
@@ -81,11 +114,71 @@ function toSummary(item) {
     year: !isNaN(yearNum) && yearNum > 0 ? yearNum : undefined,
     isbn: item.isbn ? String(item.isbn).trim() : undefined,
     status: "completed",
-    originalLanguage: item.book_lang ? item.book_lang.toLowerCase().replace(/\s*\[.*\]\s*/, "") : "en",
+    originalLanguage: normalizeLanguage(item.book_lang),
     genres: genres.length > 0 ? genres : undefined,
     chapters: 1,
     siteUrl: "https://bookracy.com",
     isFanMade,
+  };
+}
+
+function openLibraryWorkToSummary(w) {
+  if (!w || !w.title) return null;
+  const title = (w.title || "").trim();
+  const author = Array.isArray(w.author_name)
+    ? w.author_name[0]
+    : typeof w.author_name === "string"
+    ? w.author_name
+    : undefined;
+
+  const olKey = (w.key || "").replace(/^\/works\//, "");
+  const id = olKey ? `ol:${olKey}` : `ol:${encodeURIComponent(title)}`;
+
+  let cover = undefined;
+  if (w.cover_i) {
+    cover = `https://covers.openlibrary.org/b/id/${w.cover_i}-L.jpg`;
+  }
+
+  const yearNum = w.first_publish_year ? parseInt(w.first_publish_year, 10) : undefined;
+  const genres = Array.isArray(w.subject) ? w.subject.slice(0, 4) : undefined;
+
+  let isbn = undefined;
+  if (Array.isArray(w.isbn) && w.isbn.length > 0) {
+    isbn = String(w.isbn[0]).trim();
+  }
+
+  let description = undefined;
+  if (w.first_sentence) {
+    if (typeof w.first_sentence === "string") description = w.first_sentence;
+    else if (typeof w.first_sentence.value === "string") description = w.first_sentence.value;
+  }
+
+  // Cache work for detail/content lookups
+  itemCache.set(id, {
+    title,
+    author: author || "Unknown Author",
+    year: yearNum,
+    cover,
+    description,
+    openLibraryId: olKey,
+    isbn,
+  });
+
+  return {
+    id,
+    title: cleanTitle(title),
+    author: author && author !== "Unknown Author" ? author : undefined,
+    openLibraryId: olKey || undefined,
+    isbn,
+    cover: abs(cover),
+    description,
+    year: !isNaN(yearNum) && yearNum > 0 ? yearNum : undefined,
+    status: "completed",
+    originalLanguage: "en",
+    genres,
+    chapters: 1,
+    siteUrl: "https://bookracy.com",
+    isFanMade: false,
   };
 }
 
@@ -96,7 +189,6 @@ function parseZipEntries(bytes) {
   const files = [];
   let eocdOffset = -1;
 
-  // Scan backwards for End of Central Directory (0x06054b50)
   for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 65557); i--) {
     if (view.getUint32(i, true) === 0x06054b50) {
       eocdOffset = i;
@@ -157,7 +249,6 @@ async function extractEpubText(url) {
 
   const binaryString = atob(res.body);
   const len = binaryString.length;
-  // Guard against files exceeding memory limits
   if (len > 10 * 1024 * 1024) return null;
 
   const bytes = new Uint8Array(len);
@@ -254,53 +345,56 @@ const plugin = {
     const page = Math.floor((offset || 0) / 48) + 1;
     let items = [];
 
-    if (tagId === "sort:recent") {
-      try {
-        const res = await harbor.http(`${BASE_URL}/api/recent`, {
-          headers: REQ_HEADERS,
-          responseType: "json",
-          timeoutMs: 12000,
-        });
-        const data = typeof res.body === "string" ? JSON.parse(res.body) : res.body;
-        if (data && Array.isArray(data.recent) && data.recent.length > 0) {
-          items = data.recent;
-        }
-      } catch (_) {}
-    } else if (offset === 0 || !offset) {
-      try {
-        const res = await harbor.http(`${BASE_URL}/api/trending`, {
-          headers: REQ_HEADERS,
-          responseType: "json",
-          timeoutMs: 12000,
-        });
-        const data = typeof res.body === "string" ? JSON.parse(res.body) : res.body;
+    // 1. Attempt Bookracy Trending Feed
+    try {
+      const res = await harbor.http(`${BASE_URL}/api/trending`, {
+        headers: REQ_HEADERS,
+        responseType: "text",
+        timeoutMs: 10000,
+      });
+      if (res && res.ok && res.body) {
+        const data = safeParseJson(res.body);
         if (data && Array.isArray(data.trending) && data.trending.length > 0) {
-          items = data.trending;
+          items = data.trending.map(bookracyItemToSummary).filter(Boolean);
+        }
+      }
+    } catch (_) {}
+
+    // 2. Open Library Trending Fallback (guarantees books appear even if Bookracy is challenged)
+    if (items.length === 0) {
+      try {
+        const olRes = await harbor.http(`${OPEN_LIBRARY_URL}/trending/weekly.json?limit=48&page=${page}`, {
+          responseType: "text",
+          timeoutMs: 12000,
+        });
+        if (olRes && olRes.ok && olRes.body) {
+          const olData = safeParseJson(olRes.body);
+          if (olData && Array.isArray(olData.works) && olData.works.length > 0) {
+            items = olData.works.map(openLibraryWorkToSummary).filter(Boolean);
+          }
         }
       } catch (_) {}
     }
 
-    // Fallback if trending was empty or offset goes beyond trending batch
+    // 3. Third-tier genre catalog fallback
     if (items.length === 0) {
-      const query = tagId === "sort:recent" ? "new" : "fiction";
       try {
-        const res = await harbor.http(
-          `${BASE_URL}/api/books?query=${encodeURIComponent(query)}&limit=48&page=${page}&lang=all`,
-          {
-            headers: REQ_HEADERS,
-            responseType: "json",
-            timeoutMs: 12000,
+        const subjectRes = await harbor.http(`${OPEN_LIBRARY_URL}/subjects/fiction.json?limit=48&offset=${offset || 0}`, {
+          responseType: "text",
+          timeoutMs: 12000,
+        });
+        if (subjectRes && subjectRes.ok && subjectRes.body) {
+          const subData = safeParseJson(subjectRes.body);
+          if (subData && Array.isArray(subData.works)) {
+            items = subData.works.map(openLibraryWorkToSummary).filter(Boolean);
           }
-        );
-        const data = typeof res.body === "string" ? JSON.parse(res.body) : res.body;
-        items = (data && data.results) || [];
+        }
       } catch (_) {}
     }
 
     const seen = new Set();
     const results = [];
-    for (const raw of items) {
-      const summary = toSummary(raw);
+    for (const summary of items) {
       if (summary && !seen.has(summary.id)) {
         seen.add(summary.id);
         results.push(summary);
@@ -314,34 +408,56 @@ const plugin = {
     if (!query || !String(query).trim()) return [];
 
     const page = Math.floor((offset || 0) / 48) + 1;
-    let items = [];
+    const cleanQuery = String(query).trim();
+    let results = [];
 
+    // 1. Primary: Direct Bookracy Search
     try {
       const res = await harbor.http(
-        `${BASE_URL}/api/books?query=${encodeURIComponent(query.trim())}&limit=48&page=${page}&lang=all`,
+        `${BASE_URL}/api/books?query=${encodeURIComponent(cleanQuery)}&limit=48&page=${page}&lang=all`,
         {
           headers: REQ_HEADERS,
-          responseType: "json",
-          timeoutMs: 15000,
+          responseType: "text",
+          timeoutMs: 12000,
         }
       );
-      const data = typeof res.body === "string" ? JSON.parse(res.body) : res.body;
-      items = (data && data.results) || [];
-    } catch (_) {
-      return [];
+      if (res && res.ok && res.body) {
+        const data = safeParseJson(res.body);
+        if (data && Array.isArray(data.results) && data.results.length > 0) {
+          results = data.results.map(bookracyItemToSummary).filter(Boolean);
+        }
+      }
+    } catch (_) {}
+
+    // 2. Fallback: Open Library Search (if Bookracy is blocked or returns 0 results)
+    if (results.length === 0) {
+      try {
+        const olRes = await harbor.http(
+          `${OPEN_LIBRARY_URL}/search.json?q=${encodeURIComponent(cleanQuery)}&limit=48&page=${page}`,
+          {
+            responseType: "text",
+            timeoutMs: 12000,
+          }
+        );
+        if (olRes && olRes.ok && olRes.body) {
+          const olData = safeParseJson(olRes.body);
+          if (olData && Array.isArray(olData.docs) && olData.docs.length > 0) {
+            results = olData.docs.map(openLibraryWorkToSummary).filter(Boolean);
+          }
+        }
+      } catch (_) {}
     }
 
     const seen = new Set();
-    const results = [];
-    for (const raw of items) {
-      const summary = toSummary(raw);
-      if (summary && !seen.has(summary.id)) {
-        seen.add(summary.id);
-        results.push(summary);
+    const deduplicated = [];
+    for (const r of results) {
+      if (r && !seen.has(r.id)) {
+        seen.add(r.id);
+        deduplicated.push(r);
       }
     }
 
-    return results;
+    return deduplicated;
   },
 
   async detail(id) {
@@ -349,21 +465,47 @@ const plugin = {
 
     let item = itemCache.get(id);
 
-    if (!item) {
+    // If ID is Bookracy MD5
+    if (!item && id.startsWith("br:")) {
+      const rawMd5 = id.replace(/^br:/, "");
       try {
         const res = await harbor.http(
-          `${BASE_URL}/api/books?query=${encodeURIComponent(id)}&limit=5&page=1&lang=all`,
+          `${BASE_URL}/api/books?query=${encodeURIComponent(rawMd5)}&limit=5&page=1&lang=all`,
           {
             headers: REQ_HEADERS,
-            responseType: "json",
+            responseType: "text",
             timeoutMs: 12000,
           }
         );
-        const data = typeof res.body === "string" ? JSON.parse(res.body) : res.body;
-        const results = (data && data.results) || [];
-        item = results.find((r) => r.md5 === id) || results[0];
-        if (item && item.md5) {
-          itemCache.set(item.md5, item);
+        if (res && res.ok && res.body) {
+          const data = safeParseJson(res.body);
+          const results = (data && data.results) || [];
+          const found = results.find((r) => r.md5 === rawMd5) || results[0];
+          if (found) {
+            item = found;
+            itemCache.set(id, found);
+          }
+        }
+      } catch (_) {}
+    }
+
+    // If ID is Open Library work
+    if (!item && id.startsWith("ol:")) {
+      const olKey = id.replace(/^ol:/, "");
+      try {
+        const res = await harbor.http(`${OPEN_LIBRARY_URL}/works/${olKey}.json`, {
+          responseType: "text",
+          timeoutMs: 10000,
+        });
+        if (res && res.ok && res.body) {
+          const work = safeParseJson(res.body);
+          if (work) {
+            item = {
+              title: work.title,
+              description: typeof work.description === "string" ? work.description : work.description?.value,
+              openLibraryId: olKey,
+            };
+          }
         }
       } catch (_) {}
     }
@@ -371,13 +513,31 @@ const plugin = {
     if (!item) {
       return {
         id,
-        title: cleanTitle(id),
+        title: cleanTitle(id.replace(/^(br|ol):/, "")),
         status: "completed",
         siteUrl: "https://bookracy.com",
       };
     }
 
-    return toSummary(item);
+    if (item.openLibraryId) {
+      return {
+        id,
+        title: cleanTitle(item.title),
+        author: item.author && item.author !== "Unknown Author" ? item.author : undefined,
+        cover: abs(item.cover),
+        description: item.description || undefined,
+        year: item.year || undefined,
+        openLibraryId: item.openLibraryId,
+        isbn: item.isbn,
+        status: "completed",
+        originalLanguage: "en",
+        chapters: 1,
+        siteUrl: "https://bookracy.com",
+        isFanMade: false,
+      };
+    }
+
+    return bookracyItemToSummary(item);
   },
 
   async chapters(id) {
@@ -401,55 +561,59 @@ const plugin = {
     const rawId = (chapterId || "").replace(/#full$/, "");
     let item = itemCache.get(rawId);
 
-    if (!item) {
+    // If we have an Open Library item, look up the release on Bookracy
+    let bookracyRelease = null;
+    if (rawId.startsWith("br:")) {
+      const md5 = rawId.replace(/^br:/, "");
+      bookracyRelease = itemCache.get(md5) || item;
+    } else if (item && item.title) {
       try {
+        const q = `${item.title} ${item.author || ""}`.trim();
         const res = await harbor.http(
-          `${BASE_URL}/api/books?query=${encodeURIComponent(rawId)}&limit=5&page=1&lang=all`,
+          `${BASE_URL}/api/books?query=${encodeURIComponent(q)}&limit=3&page=1&lang=all`,
           {
             headers: REQ_HEADERS,
-            responseType: "json",
+            responseType: "text",
             timeoutMs: 12000,
           }
         );
-        const data = typeof res.body === "string" ? JSON.parse(res.body) : res.body;
-        const results = (data && data.results) || [];
-        item = results.find((r) => r.md5 === rawId) || results[0];
-        if (item && item.md5) {
-          itemCache.set(item.md5, item);
+        if (res && res.ok && res.body) {
+          const data = safeParseJson(res.body);
+          if (data && Array.isArray(data.results) && data.results.length > 0) {
+            bookracyRelease = data.results[0];
+          }
         }
       } catch (_) {}
     }
 
-    const title = item ? cleanTitle(item.title) : cleanTitle(rawId);
-    const author = item ? item.author : "Unknown Author";
-    const downloadUrl = item ? (item.link || "") : "";
-    const filetype = item ? (item.book_filetype || "").toLowerCase() : "";
+    const title = (bookracyRelease && bookracyRelease.title) || (item && item.title) || cleanTitle(rawId);
+    const author = (bookracyRelease && bookracyRelease.author) || (item && item.author) || "Unknown Author";
+    const downloadUrl = (bookracyRelease && bookracyRelease.link) || "";
+    const filetype = (bookracyRelease && bookracyRelease.book_filetype || "").toLowerCase();
+    const description = (bookracyRelease && bookracyRelease.description) || (item && item.description) || "";
 
-    // Attempt native in-engine EPUB text extraction
+    // Attempt native EPUB decompression
     if (downloadUrl && filetype === "epub") {
       try {
         const extracted = await extractEpubText(downloadUrl);
         if (extracted && extracted.trim().length > 100) {
           return extracted;
         }
-      } catch (_) {
-        // Fall through to reader fallback
-      }
+      } catch (_) {}
     }
 
     // High-fidelity fallback reading card
     const parts = [
       `# ${title}`,
       author && author !== "Unknown Author" ? `**Author:** ${author}` : "",
-      item && item.description ? `\n## Synopsis\n${item.description}\n` : "",
+      description ? `\n## Synopsis\n${description}\n` : "",
       "---",
-      `* **Format:** ${(filetype || "EBOOK").toUpperCase()}`,
-      item && item.book_size ? `* **Size:** ${item.book_size}` : "",
-      item && item.year ? `* **Release Year:** ${item.year}` : "",
-      item && item.isbn ? `* **ISBN:** ${item.isbn}` : "",
-      item && item.publisher ? `* **Publisher:** ${item.publisher}` : "",
+      filetype ? `* **Format:** ${filetype.toUpperCase()}` : "* **Source:** Bookracy Open Library",
+      bookracyRelease && bookracyRelease.book_size ? `* **Size:** ${bookracyRelease.book_size}` : "",
+      bookracyRelease && bookracyRelease.year ? `* **Release Year:** ${bookracyRelease.year}` : "",
+      bookracyRelease && bookracyRelease.isbn ? `* **ISBN:** ${bookracyRelease.isbn}` : "",
       "",
-      downloadUrl ? `Direct Download / Stream Link:\n${downloadUrl}` : "",
+      downloadUrl ? `Direct Download / Stream Link:\n${downloadUrl}` : "Search and stream on Bookracy: https://bookracy.com",
     ].filter(Boolean);
 
     return parts.join("\n\n");
@@ -457,16 +621,15 @@ const plugin = {
 
   async tags() {
     return [
-      { id: "sort:popular", name: "Popular / Trending", group: "Sort" },
-      { id: "sort:recent", name: "Recently Added", group: "Sort" },
+      { id: "sort:popular", name: "Popular", group: "Sort" },
       { id: "status:completed", name: "Completed", group: "Status" },
     ];
   },
 };
 
 // Register in Harbor worker
-if (typeof harbor !== "undefined" && typeof harbor.register === "function") {
-  harbor.register(plugin);
+if (typeof harbor !== "undefined") {
+  if (typeof harbor.register === "function") {
+    harbor.register(plugin);
+  }
 }
-
-return plugin;
