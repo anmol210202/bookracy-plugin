@@ -1,11 +1,11 @@
 {
   "type": "ebook",
-  "name": "Bookracy Repo",
+  "name": "Bookracy eBook Repository",
   "plugins": [
     {
-      "id": "bookracy-source",
+      "id": "bookracy",
       "name": "Bookracy",
-      "version": "1.7.0",
+      "version": "1.0.0",
       "lang": "en",
       "nsfw": false,
       "icon": "https://bookracy.com/favicon.ico",
