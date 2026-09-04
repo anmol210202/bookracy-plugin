@@ -1,5 +1,4 @@
 // Harbor eBook source plugin for Bookracy (api.bookracy.com)
-// Pure Bookracy API implementation with zero Open Library calls
 
 const BASE = "https://api.bookracy.com";
 
@@ -11,7 +10,7 @@ const HEADERS = {
   Origin: "https://bookracy.com",
 };
 
-// In-memory cache for fast lookup during an active session
+// In-memory cache for fast lookups across views
 const cache = new Map();
 
 async function fetchJson(url) {
@@ -30,11 +29,13 @@ async function fetchJson(url) {
   }
 }
 
+// Covers MUST be absolute http(s) or Harbor drops them
 function abs(url) {
   if (!url) return undefined;
   if (/^https?:\/\//i.test(url)) return url;
   if (url.startsWith("//")) return "https:" + url;
-  return BASE + (url.startsWith("/") ? url : "/" + url);
+  if (url.startsWith("/")) return BASE + url;
+  return BASE + "/" + url;
 }
 
 function cleanTitle(val) {
@@ -45,14 +46,14 @@ function cleanTitle(val) {
     .trim();
 }
 
-// Drops Cyrillic, Chinese, and non-English scripts so Harbor's English catalog stays clean
 function isEnglishBook(item) {
   if (!item || !item.title) return false;
-  if (/[\u0400-\u04FF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]/.test(item.title)) {
+  // Exclude non-Latin scripts (Cyrillic, CJK, Arabic)
+  if (/[\u0400-\u04FF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF\u0600-\u06FF]/.test(item.title)) {
     return false;
   }
-  const lang = (item.book_lang || "").toLowerCase();
-  if (lang && !lang.includes("en") && !lang.includes("eng") && lang !== "unknown") {
+  const lang = (item.book_lang || "").toLowerCase().trim();
+  if (lang && !lang.includes("en") && !lang.includes("eng") && lang !== "unknown" && lang !== "") {
     return false;
   }
   return true;
@@ -61,9 +62,9 @@ function isEnglishBook(item) {
 function itemToSummary(item) {
   if (!item || !item.md5) return null;
 
+  const id = String(item.md5).trim();
   const title = cleanTitle(item.title || "Untitled");
   const author = (item.author || "").trim();
-  const id = String(item.md5).trim();
 
   cache.set(id, {
     title,
@@ -88,29 +89,33 @@ const plugin = {
   id: "bookracy-source",
   name: "Bookracy",
 
-  // Popular Shelf: Direct Bookracy English catalog queries
+  // Instant catalog discovery: single network roundtrip
   async popular(offset, tagId) {
-    const page = Math.floor(offset / 30) + 1;
-    let query = "novel";
+    const safeOffset = Number(offset) || 0;
+    const page = Math.floor(safeOffset / 30) + 1;
+    let query = "bestseller";
 
-    if (tagId?.startsWith("genre:")) {
-      query = tagId.slice(6).replace("-", " ");
+    if (tagId === "sort:rating") {
+      query = "award winner";
     } else if (tagId === "sort:popular") {
       query = "bestseller";
-    } else if (tagId === "sort:rating") {
-      query = "award";
+    } else if (tagId?.startsWith("genre:")) {
+      query = tagId.slice(6).replace("-", " ");
     }
 
     const url = `${BASE}/api/books?query=${encodeURIComponent(query)}&lang=all&page=${page}&limit=50`;
     const data = await fetchJson(url);
     const list = Array.isArray(data) ? data : data.results || [];
+
     return list.filter(isEnglishBook).map(itemToSummary).filter(Boolean);
   },
 
-  // Search: Direct Bookracy query search
+  // Instant search: single network roundtrip
   async search(query, offset, tagId) {
-    const page = Math.floor(offset / 30) + 1;
-    let target = query || "fiction";
+    const safeOffset = Number(offset) || 0;
+    const page = Math.floor(safeOffset / 30) + 1;
+    let target = (query || "").trim() || "fiction";
+
     if (tagId?.startsWith("genre:")) {
       target += " " + tagId.slice(6).replace("-", " ");
     }
@@ -118,14 +123,14 @@ const plugin = {
     const url = `${BASE}/api/books?query=${encodeURIComponent(target)}&lang=all&page=${page}&limit=50`;
     const data = await fetchJson(url);
     const list = Array.isArray(data) ? data : data.results || [];
+
     return list.filter(isEnglishBook).map(itemToSummary).filter(Boolean);
   },
 
-  // Detail: Enriched using Bookracy's Apple Books metadata endpoint
+  // Single-target deep metadata enrichment
   async detail(id) {
     let cached = cache.get(id);
 
-    // If cache is empty (e.g. app restart), re-query Bookracy by MD5
     if (!cached || !cached.title) {
       try {
         const lookup = await fetchJson(`${BASE}/api/books?query=${encodeURIComponent(id)}&lang=all&limit=1`);
@@ -139,9 +144,7 @@ const plugin = {
           };
           cache.set(id, cached);
         }
-      } catch {
-        // Fallback continues
-      }
+      } catch (_) {}
     }
 
     let title = cached?.title || id;
@@ -152,17 +155,17 @@ const plugin = {
     let isbn = undefined;
     let score = undefined;
 
-    // Query Bookracy Apple Books resolver for high-res cover, rating, and synopsis
+    // Fetch Apple Books metadata from Bookracy resolver
     try {
-      const queryParams = new URLSearchParams();
+      const qParams = new URLSearchParams();
       if (title && title !== id) {
-        queryParams.set("title", author ? `${title} - ${author}` : title);
+        qParams.set("title", author ? `${title} - ${author}` : title);
       }
       if (author) {
-        queryParams.set("author", author);
+        qParams.set("author", author);
       }
 
-      const metaResp = await fetchJson(`${BASE}/api/metadata/${id}?${queryParams.toString()}`);
+      const metaResp = await fetchJson(`${BASE}/api/metadata/${id}?${qParams.toString()}`);
       const meta = metaResp?.metadata || metaResp || {};
 
       if (meta.title) title = cleanTitle(meta.title);
@@ -172,9 +175,7 @@ const plugin = {
       if (Array.isArray(meta.genres) && meta.genres.length > 0) genres = meta.genres;
       if (meta.isbn) isbn = meta.isbn;
       if (meta.rating) score = Number(meta.rating);
-    } catch {
-      // Fallback retains clean title and author
-    }
+    } catch (_) {}
 
     return {
       id,
@@ -194,16 +195,17 @@ const plugin = {
   async chapters(id) {
     return [
       {
-        id: `${id}_1`,
+        id: `${id}:1`,
         chapter: "1",
         position: 0,
         title: "Complete Edition",
+        language: "en",
       },
     ];
   },
 
   async content(chapterId) {
-    const id = chapterId.replace(/_1$/, "");
+    const id = chapterId.split(":")[0];
     const cached = cache.get(id);
     const title = cached?.title || "Book Overview";
     const author = cached?.author ? `by ${cached.author}` : "";
@@ -212,10 +214,10 @@ const plugin = {
       `# ${title}`,
       author,
       "",
-      "This book is indexed on the Bookracy network.",
+      cached?.description || "This title is available as an eBook on the Bookracy network.",
       "",
       "---",
-      `MD5: ${id}`,
+      `Source ID: ${id}`,
     ]
       .filter(Boolean)
       .join("\n\n");
@@ -225,11 +227,11 @@ const plugin = {
     return [
       { id: "sort:popular", name: "Popular", group: "Sort" },
       { id: "sort:rating", name: "Award Winners", group: "Sort" },
+      { id: "genre:fiction", name: "Fiction", group: "Genre" },
       { id: "genre:science-fiction", name: "Sci-Fi", group: "Genre" },
       { id: "genre:fantasy", name: "Fantasy", group: "Genre" },
-      { id: "genre:cyberpunk", name: "Cyberpunk", group: "Genre" },
       { id: "genre:thriller", name: "Thriller", group: "Genre" },
-      { id: "genre:philosophy", name: "Philosophy", group: "Genre" },
+      { id: "genre:mystery", name: "Mystery", group: "Genre" },
     ];
   },
 };
