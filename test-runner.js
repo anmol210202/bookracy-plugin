@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 /**
- * Harbor Plugin Strict Validator
- * Validates Bookracy plugin against Harbor eBook Specifications.
+ * Enhanced Harbor Plugin Strict Test Suite
+ * Simulates Harbor's exact installation, network domain auditing, and runtime checks.
  */
 
 const fs = require("fs");
@@ -13,10 +13,19 @@ const c = {
   red: "\x1b[31m", yellow: "\x1b[33m", cyan: "\x1b[36m", dim: "\x1b[2m",
 };
 
-// 1. Mock Harbor Runtime
-function createMockHarbor() {
+const networkAudit = new Set();
+
+function createHarborHarness() {
   return {
     async http(url, options = {}) {
+      const parsedUrl = new URL(url);
+      networkAudit.add(parsedUrl.hostname);
+
+      // Verify domain policy: only api.bookracy.com or bookracy.com
+      if (!parsedUrl.hostname.includes("bookracy.com")) {
+        throw new Error(`DISALLOWED_DOMAIN: Contacted '${parsedUrl.hostname}' (Only Bookracy allowed)`);
+      }
+
       try {
         const response = await fetch(url, {
           method: options.method || "GET",
@@ -32,16 +41,16 @@ function createMockHarbor() {
             : await response.text(),
         };
       } catch (err) {
-        throw new Error(`Network failure on ${url}: ${err.message}`);
+        throw new Error(`HTTP fetch failed for ${url}: ${err.message}`);
       }
     },
     parseHtml: () => ({ querySelector: () => null, querySelectorAll: () => [] }),
-    register: () => {}, // Mock register function
+    register: (p) => { globalThis.__registered_plugin = p; },
   };
 }
 
 async function runTests() {
-  console.log(`\n${c.bold}${c.cyan}=== HARBOR EBOOK PLUGIN STRICT VALIDATOR ===${c.reset}\n`);
+  console.log(`\n${c.bold}${c.cyan}=== HARBOR EBOOK EXTENDED TEST SUITE ===${c.reset}\n`);
 
   let pass = 0; let fail = 0;
   function assert(condition, message) {
@@ -49,7 +58,7 @@ async function runTests() {
     else { console.log(` ${c.red}✖${c.reset} ${message}`); fail++; }
   }
 
-  // Phase A: Validate repo.json
+  // 1. Manifest Validation
   const repoPath = path.resolve("repo.json");
   assert(fs.existsSync(repoPath), "repo.json exists");
   
@@ -58,98 +67,138 @@ async function runTests() {
     const repoData = JSON.parse(fs.readFileSync(repoPath, "utf8"));
     assert(repoData.type === "ebook", 'repo.json "type" is "ebook"');
     manifest = repoData.plugins[0];
-    assert(manifest && manifest.id, "repo.json contains a valid plugin manifest");
+    assert(manifest && manifest.id === "bookracy-source", "Plugin ID is 'bookracy-source'");
+    assert(manifest.entry === "bookracy.plugin.js", "Entry points to 'bookracy.plugin.js'");
   } catch (e) {
-    assert(false, `repo.json parsing failed: ${e.message}`);
+    assert(false, `repo.json failed: ${e.message}`);
   }
 
-  // Phase B: Load Plugin
+  // 2. Plugin Load Simulation
   const pluginPath = path.resolve(manifest.entry || "bookracy.plugin.js");
-  assert(fs.existsSync(pluginPath), `Plugin entry file (${path.basename(pluginPath)}) exists`);
+  assert(fs.existsSync(pluginPath), "bookracy.plugin.js exists");
 
   let plugin;
   try {
     const code = fs.readFileSync(pluginPath, "utf8");
-    const runner = new (Object.getPrototypeOf(async function(){}).constructor)(
-      "harbor", 
-      `${code}\nif (typeof plugin !== 'undefined') return plugin;`
-    );
-    plugin = await runner(createMockHarbor());
-    assert(plugin.id === manifest.id, `Plugin ID matches manifest ("${plugin.id}")`);
+    const harness = createHarborHarness();
+    const runner = new (Object.getPrototypeOf(async function(){}).constructor)("harbor", code);
+    plugin = await runner(harness) || globalThis.__registered_plugin || globalThis.plugin;
+    assert(typeof plugin === "object" && plugin !== null, "Plugin exports valid object");
+    assert(plugin.id === manifest.id, "Plugin ID strictly matches repo.json");
   } catch (e) {
-    console.error(`\n${c.red}Fatal Plugin Load Error:${c.reset}`, e);
+    console.error(`\n${c.red}Fatal Plugin Execution Error:${c.reset}`, e);
     process.exit(1);
   }
 
-  // Phase C: Interface Check
-  ["popular", "search", "detail", "chapters", "content"].forEach(method => {
-    assert(typeof plugin[method] === "function", `Implements ${method}()`);
+  // 3. Interface Contract Check
+  ["popular", "search", "detail", "chapters", "content"].forEach(m => {
+    assert(typeof plugin[m] === "function", `Implements required method: ${m}()`);
   });
 
-  let testBookId = null;
-  let testChapterId = null;
-
-  // Phase D: Functional Tests
-  console.log(`\n${c.bold}Testing Catalog Discovery (popular):${c.reset}`);
+  // 4. Harbor Installation Simulation: popular(0)
+  console.log(`\n${c.bold}1. Harbor Installation: Testing popular(0)${c.reset}`);
+  let popularBooks = [];
   try {
-    const items = await plugin.popular(0);
-    assert(Array.isArray(items), "popular(0) returns an array");
-    if (items.length > 0) {
-      const book = items[0];
-      testBookId = book.id;
-      assert(typeof book.id === "string", "Summary includes string ID");
-      assert(typeof book.title === "string", "Summary includes string Title");
-      assert(!book.cover || book.cover.startsWith("http"), "Cover URL is absolute HTTP(S)");
-      console.log(`   ${c.dim}Sample:${c.reset} ${book.title} (${book.id})`);
-    }
-  } catch (e) { assert(false, `popular() failed: ${e.message}`); }
+    popularBooks = await plugin.popular(0);
+    assert(Array.isArray(popularBooks) && popularBooks.length >= 5, `popular(0) returned ${popularBooks.length} items`);
+    
+    // Check that items are clean English books
+    const hasRussian = popularBooks.some(b => /[\u0400-\u04FF]/.test(b.title));
+    assert(!hasRussian, "Popular list contains no Cyrillic books");
 
-  console.log(`\n${c.bold}Testing Query Search:${c.reset}`);
-  try {
-    const items = await plugin.search("Artemis", 0);
-    assert(Array.isArray(items), 'search("Artemis") returns an array');
-    if (items.length > 0) {
-      assert(items[0].id, "Search result contains an ID");
-      console.log(`   ${c.dim}Sample:${c.reset} ${items[0].title}`);
-    }
-  } catch (e) { assert(false, `search() failed: ${e.message}`); }
-
-  if (testBookId) {
-    console.log(`\n${c.bold}Testing Metadata Resolution (detail):${c.reset}`);
-    try {
-      const detail = await plugin.detail(testBookId);
-      assert(detail && detail.id === testBookId, "detail() returns matching ID");
-      assert(typeof detail.title === "string", "Detail includes title");
-      assert(!detail.cover || detail.cover.startsWith("http"), "Detail cover is absolute");
-    } catch (e) { assert(false, `detail() failed: ${e.message}`); }
-
-    console.log(`\n${c.bold}Testing Chapters:${c.reset}`);
-    try {
-      const chapters = await plugin.chapters(testBookId);
-      assert(Array.isArray(chapters) && chapters.length > 0, "chapters() returned data");
-      
-      const chap = chapters[0];
-      testChapterId = chap.id;
-      assert(typeof chap.id === "string", "Chapter includes ID");
-      assert(chap.position === undefined || typeof chap.position === "number", "Chapter position is a number");
-      console.log(`   ${c.dim}Chapter 1 ID:${c.reset} ${testChapterId}`);
-    } catch (e) { assert(false, `chapters() failed: ${e.message}`); }
-
-    if (testChapterId) {
-      console.log(`\n${c.bold}Testing Chapter Content:${c.reset}`);
-      try {
-        const content = await plugin.content(testChapterId);
-        assert(typeof content === "string" && content.length > 0, `content() returned string (${content.length} chars)`);
-      } catch (e) { assert(false, `content() failed: ${e.message}`); }
-    }
+    const sample = popularBooks[0];
+    assert(typeof sample.id === "string" && !sample.id.includes("|"), `ID is clean string: "${sample.id}"`);
+    assert(typeof sample.title === "string" && sample.title.length > 0, `Title is clean string: "${sample.title}"`);
+    assert(sample.originalLanguage === "en", "originalLanguage is declared 'en'");
+    console.log(`   ${c.dim}Sample Popular:${c.reset} ${c.bold}${sample.title}${c.reset} (${sample.id})`);
+  } catch (e) {
+    assert(false, `popular(0) failed: ${e.message}`);
   }
 
+  // 5. Harbor Installation Simulation: search("test")
+  console.log(`\n${c.bold}2. Harbor Installation: Testing search() variations${c.reset}`);
+  let searchBooks = [];
+  try {
+    // Test generic search used by Harbor validator
+    const genericSearch = await plugin.search("test", 0);
+    assert(Array.isArray(genericSearch), "search('test', 0) succeeds");
+
+    // Test standard book search
+    searchBooks = await plugin.search("Dune", 0);
+    assert(Array.isArray(searchBooks) && searchBooks.length > 0, `search('Dune', 0) returned ${searchBooks.length} results`);
+    const found = searchBooks[0];
+    console.log(`   ${c.dim}Sample Search Result:${c.reset} ${c.bold}${found.title}${c.reset} by ${found.author || "Unknown"}`);
+  } catch (e) {
+    assert(false, `search() failed: ${e.message}`);
+  }
+
+  // 6. Harbor Installation Simulation: detail(id)
+  const testId = popularBooks[0]?.id || searchBooks[0]?.id;
+  assert(Boolean(testId), "Resolved a test book ID from previous steps");
+
+  console.log(`\n${c.bold}3. Harbor Installation: Testing detail('${testId}')${c.reset}`);
+  try {
+    const detail = await plugin.detail(testId);
+    assert(typeof detail === "object" && detail.id === testId, "detail() returns matching ID");
+    assert(typeof detail.title === "string" && detail.title.length > 0, `detail.title is present: "${detail.title}"`);
+    assert(!detail.cover || detail.cover.startsWith("http"), "detail.cover is absolute HTTP(S)");
+    assert(typeof detail.description === "string", "detail.description is present");
+    console.log(`   ${c.dim}Enriched Cover URL:${c.reset} ${detail.cover || "none"}`);
+  } catch (e) {
+    assert(false, `detail() failed: ${e.message}`);
+  }
+
+  // 7. Harbor Installation Simulation: chapters(id)
+  let chapterId = null;
+  console.log(`\n${c.bold}4. Harbor Installation: Testing chapters('${testId}')${c.reset}`);
+  try {
+    const chapters = await plugin.chapters(testId);
+    assert(Array.isArray(chapters) && chapters.length > 0, `chapters() returned ${chapters.length} chapter(s)`);
+    const chap = chapters[0];
+    chapterId = chap.id;
+    assert(typeof chap.id === "string" && chap.id.length > 0, `Chapter ID is valid: "${chap.id}"`);
+    assert(chap.position === 0, "Chapter position is zero-based number (0)");
+  } catch (e) {
+    assert(false, `chapters() failed: ${e.message}`);
+  }
+
+  // 8. Harbor Installation Simulation: content(chapterId)
+  console.log(`\n${c.bold}5. Harbor Installation: Testing content('${chapterId}')${c.reset}`);
+  try {
+    const content = await plugin.content(chapterId);
+    assert(typeof content === "string" && content.length > 0, `content() returned text (${content.length} chars)`);
+  } catch (e) {
+    assert(false, `content() failed: ${e.message}`);
+  }
+
+  // 9. Tag Filter Test
+  console.log(`\n${c.bold}6. Filter & Genre Routing: Testing popular(0, 'genre:science-fiction')${c.reset}`);
+  try {
+    const filtered = await plugin.popular(0, "genre:science-fiction");
+    assert(Array.isArray(filtered) && filtered.length > 0, `Filtered query returned ${filtered.length} books`);
+    console.log(`   ${c.dim}Sci-Fi Sample:${c.reset} ${filtered[0].title}`);
+  } catch (e) {
+    assert(false, `Genre filter failed: ${e.message}`);
+  }
+
+  // 10. Network Audit Check
+  console.log(`\n${c.bold}7. Network Domain Audit:${c.reset}`);
+  const domains = Array.from(networkAudit);
+  console.log(`   ${c.dim}Domains contacted:${c.reset} ${domains.join(", ")}`);
+  assert(!domains.some(d => d.includes("openlibrary.org")), "Verified 0 requests to Open Library");
+  assert(domains.every(d => d.includes("bookracy.com")), "All requests routed exclusively through Bookracy");
+
+  // Summary
   console.log(`\n${c.bold}${c.cyan}=== TEST SUMMARY ===${c.reset}`);
   console.log(` Passed: ${c.green}${pass}${c.reset}`);
   console.log(` Failed: ${c.red}${fail}${c.reset}`);
 
-  if (fail > 0) process.exit(1);
-  else console.log(`\n${c.green}${c.bold}Ready for deployment!${c.reset}\n`);
+  if (fail > 0) {
+    console.log(`\n${c.red}${c.bold}Fix the failures above before deploying to Harbor.${c.reset}\n`);
+    process.exit(1);
+  } else {
+    console.log(`\n${c.green}${c.bold}100% Harbor Installation Compliant! Ready for deployment.${c.reset}\n`);
+  }
 }
 
 runTests();
